@@ -1,0 +1,5 @@
+yt-dlp
+requests
+pyrogram
+tgcrypto
+Pillow

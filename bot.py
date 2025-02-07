@@ -1,9 +1,11 @@
 import os
+import sys
 import re
 import time
 import logging
 import tempfile
 import yt_dlp
+import ffmpeg
 import requests
 import subprocess
 import glob
@@ -16,6 +18,7 @@ from config import (
     API_ID,
     API_HASH,
     BOT_TOKEN,
+    OWNER_ID,
     ALLOWED_USERS,
     COOKIES_URL,
     PROGRESS_UPDATE_INTERVAL,
@@ -25,6 +28,7 @@ from config import (
     AV1_FOR_LOWRES,
     AV1_FOR_HIGHRES    # Yeni: Youtube Data API anahtarı
 )
+import json
 
 # Eğer PROGRESS_UPDATE_INTERVAL tanımlı değilse varsayılan 7 saniye.
 if not PROGRESS_UPDATE_INTERVAL:
@@ -70,6 +74,7 @@ def start_quality_timeout(user_id: int, quality_msg: types.Message):
     user_data = user_video_info.get(user_id)
     if user_data and not user_data.get("selection_made", False):
         try:
+            logger.info("Kalite seçilmedi, işlem iptal edildi")
             quality_msg.edit_text("Herhangi bir kalite seçmedin, işlem iptal edildi.", reply_markup=None)
         except Exception as e:
             logger.error("Kalite timeout mesajı güncellenirken hata: %s", e)
@@ -95,13 +100,63 @@ def search_youtube(query: str, max_results: int = 20):
         raise Exception(f"Youtube API hatası: {response.status_code} - {response.text}")
     return response.json()
 
+# Inline modda arama sorgularını işleyen örnek handler:
+@app.on_inline_query()
+def inline_query_handler(client, query: types.InlineQuery):
+    search_text = query.query.strip()
+    if not search_text:
+        # Eğer sorgu boşsa boş sonuç döndürüyoruz.
+        query.answer([], cache_time=0)
+        return
+
+    try:
+        # search_youtube fonksiyonu kullanılarak arama yapılıyor.
+        data = search_youtube(search_text, max_results=10)
+        items = data.get("items", [])
+    except Exception as e:
+        logger.error("Inline arama sırasında hata: %s", e)
+        query.answer([], switch_pm_text="Arama sırasında hata oluştu.", switch_pm_parameter="start")
+        return
+
+    results = []
+    for item in items:
+        video_id = item.get("id", {}).get("videoId")
+        snippet = item.get("snippet", {})
+        title = snippet.get("title")
+        description = snippet.get("description", "")
+        if not video_id or not title:
+            continue
+
+        # Eğer başlık çok uzun ise kısaltıyoruz.
+        if len(title) > 40:
+            title = title[:40] + "..."
+
+        # InlineQueryResultArticle kullanarak bir sonuç oluşturuyoruz.
+        result = types.InlineQueryResultArticle(
+            id=video_id,
+            title=title,
+            description=description,
+            input_message_content=types.InputTextMessageContent(
+                message_text=f"https://www.youtube.com/watch?v={video_id}"
+            )
+        )
+        results.append(result)
+
+    query.answer(results, cache_time=0)
+
+def check_disk_space(required_space: int) -> bool:
+    """Check if there is at least twice the required space available on the disk."""
+    statvfs = os.statvfs('/')
+    free_space = statvfs.f_frsize * statvfs.f_bavail
+    return free_space >= required_space * 2
+
 def prepare_video_info_and_show_quality(chat_id: int, user_id: int, video_url: str, status_msg: types.Message = None):
     """
-    Verilen video_url için yt-dlp ile video bilgilerini alır, 
+    Verilen video_url için yt-dlp ile video bilgilerini alır,
     user_video_info'yu günceller ve kalite seçeneklerini inline butonlarla kullanıcıya sunar.
     Eğer status_msg parametresi verilmişse, o mesaj üzerinden düzenleme yapılır.
     """
-    
+
     user_video_info[user_id] = {
         "url": video_url,
         "formats": {},
@@ -168,7 +223,8 @@ def prepare_video_info_and_show_quality(chat_id: int, user_id: int, video_url: s
             video_options.append((fmt_id, desc))
             user_video_info[user_id]["formats"][fmt_id] = {
                 "has_audio": f.get('acodec') != 'none',
-                "desc": desc
+                "desc": desc,
+                "filesize": filesize
             }
 
     # Ses için bestaudio:
@@ -180,7 +236,8 @@ def prepare_video_info_and_show_quality(chat_id: int, user_id: int, video_url: s
         audio_button_text = f"Müzik: en iyi - {size_str} (id: {bestaudio.get('format_id')}, ext: mp3)"
         user_video_info[user_id]["bestaudio_info"] = {
             "format_id": bestaudio.get("format_id"),
-            "ext": bestaudio.get("ext")
+            "ext": bestaudio.get("ext"),
+            "filesize": size
         }
     else:
         audio_button_text = "Müzik: en iyi (bilgi yok)"
@@ -219,6 +276,349 @@ def start(client, message):
         return
     message.reply_text("Merhaba! Lütfen indirmek istediğiniz video/ses linkini veya arama sorgusunu gönderiniz.")
 
+@app.on_message(filters.command("restart") & filters.private)
+def restart_bot(client, message):
+    # Yetkili kullanıcı kontrolü
+    if message.from_user.id != OWNER_ID:
+        message.reply_text("Bu komutu kullanmaya yetkiniz yok.")
+        return
+
+    message.reply_text("Bot yeniden başlatılıyor...")
+    # Kısa bir süre uyutup, ardından botu yeniden başlatıyoruz.
+    # os.execv() mevcut process'i tamamen yeni process ile değiştirir.
+    try:
+        # Öncelikle mesajın gönderilmesi için kısa bir gecikme ekleyelim.
+        time.sleep(2)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    except Exception as e:
+        logger.error("Bot yeniden başlatılırken hata oluştu: %s", e)
+        message.reply_text(f"Bot yeniden başlatılırken hata oluştu: {e}")
+
+def get_free_space_gb() -> float:
+    """Get the available disk space in GB."""
+    statvfs = os.statvfs('/')
+    free_space = statvfs.f_frsize * statvfs.f_bavail
+    return free_space / (1024 ** 3)
+
+@app.on_message(filters.command("free") & filters.private)
+def free_space(client, message):
+    if message.from_user.id not in ALLOWED_USERS:
+        message.reply_text("Üzgünüm, bu botu kullanmaya yetkiniz yok.")
+        return
+
+    free_space_gb = get_free_space_gb()
+    message.reply_text(f"Diskte {free_space_gb:.2f} GB boş alan var.")
+
+def save_allowed_users():
+    with open("config.py", "r") as f:
+        lines = f.readlines()
+    with open("config.py", "w") as f:
+        for line in lines:
+            if line.startswith("ALLOWED_USERS"):
+                f.write(f"ALLOWED_USERS = {json.dumps(list(ALLOWED_USERS))}\n")
+            else:
+                f.write(line)
+
+@app.on_message(filters.command("sudo") & filters.private)
+def sudo_user(client, message):
+    if message.from_user.id != OWNER_ID:
+        message.reply_text("Bu komutu kullanmaya yetkiniz yok.")
+        return
+
+    try:
+        user_id = int(message.command[1])
+        if user_id in ALLOWED_USERS:
+            message.reply_text("Bu kullanıcı zaten yetkili.")
+        else:
+            ALLOWED_USERS.add(user_id)
+            save_allowed_users()
+            message.reply_text(f"Kullanıcı {user_id} yetkilendirildi.")
+            logger.info(f"Kullanıcı {user_id} yetkilendirildi.")
+    except (IndexError, ValueError):
+        message.reply_text("Geçerli bir kullanıcı ID'si girin.")
+
+@app.on_message(filters.command("unsudo") & filters.private)
+def unsudo_user(client, message):
+    if message.from_user.id != OWNER_ID:
+        message.reply_text("Bu komutu kullanmaya yetkiniz yok.")
+        return
+
+    try:
+        user_id = int(message.command[1])
+        if user_id not in ALLOWED_USERS:
+            message.reply_text("Bu kullanıcı zaten yetkili değil.")
+        else:
+            ALLOWED_USERS.remove(user_id)
+            save_allowed_users()
+            message.reply_text(f"Kullanıcı {user_id} yetkisi kaldırıldı.")
+            logger.info(f"Kullanıcı {user_id} yetkisi kaldırıldı.")
+    except (IndexError, ValueError):
+        message.reply_text("Geçerli bir kullanıcı ID'si girin.")
+
+def download_direct_link(url: str, output_path: str, status_msg: types.Message):
+    try:
+        cmd = ["curl", "--progress-bar", "--no-buffer", "-L", "-o", output_path, url]
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        start_time = time.time()
+        last_progress_update = time.time()
+        pattern = re.compile(r'(\d+(?:\.\d+)?)%')
+        eta_pattern = re.compile(r'eta\s+(\d+)\s*s', re.IGNORECASE)
+
+        while process.poll() is None:
+            line = process.stderr.readline().strip()
+            if not line:
+                continue
+            m = pattern.search(line)
+            if m:
+                try:
+                    percent = float(m.group(1))
+                    elapsed = time.time() - start_time
+                    if percent > 0:
+                        eta = elapsed * (100 - percent) / percent
+                    else:
+                        eta = 0
+                except Exception as e:
+                    logger.error("Yüzde ve ETA hesaplama hatası: %s", e)
+                    percent = 0
+                if time.time() - last_progress_update >= PROGRESS_UPDATE_INTERVAL:
+                    last_progress_update = time.time()
+                    try:
+                        logger.info(f"İndiriliyor: {percent:.2f}% - Kalan süre: {int(eta)} sn")
+                        status_msg.edit_text(f"İndiriliyor: {percent:.2f}% - Kalan süre: {int(eta)} sn")
+                    except Exception as e:
+                        logger.error("İndirme güncelleme hatası: %s", e)
+        return process.returncode == 0
+    except Exception as e:
+        logger.error("Direct download failed: %s", e)
+        return False
+    
+def extract_thumbnail(video_path, thumb_path, timestamp="00:00:10"):
+    try:
+        if thumb_path is None:
+            thumb_path = "{os.path.splitext(video_path)[0]}.jpg"
+
+        # FFmpeg ile thumbnail oluştur
+        (
+            ffmpeg
+            .input(video_path, ss=timestamp)  # 10. saniyeden itibaren başla
+            .output(thumb_path, vframes=1)  # Tek bir kare al
+            .run(overwrite_output=True, capture_stdout=True, capture_stderr=True)  # Sessiz çalıştır
+        )
+
+        # Oluşan dosyanın var olup olmadığını kontrol et
+        if not os.path.exists(thumb_path):
+            logger.error("Thumbnail oluşturulamadı: %s", e)
+            return False
+        
+        # PIL ile görüntüyü açıp RGB olarak tekrar kaydet
+        with Image.open(thumb_path) as img:
+            rgb_im = img.convert("RGB")
+            rgb_im.save(thumb_path, format="JPEG")
+        
+        logger.info("Thumbnail ffmpeg ile üretildi")
+        return True  # Başarıyla tamamlandı
+
+    except Exception as e:
+        logger.error("Thumbnail oluşturulurken hata: %s", e)
+        return False  # Hata oluştuysa başarısız olduğunu döndür
+
+def upload_file(
+    file_path,
+    status_msg,
+    download_type,
+    chat_id,
+    caption,
+    duration,
+    caption_file_name=None,
+    tmpdirname=None,
+    thumb_file_path=None,
+    max_file_size=2097152000,
+):
+    # Geçici dizin ve dosya adını ayarla
+    if tmpdirname is None:
+        tmpdirname = os.path.dirname(file_path)
+    if caption_file_name is None:
+        caption_file_name = os.path.basename(file_path)
+
+    try:
+        file_size = os.path.getsize(file_path)
+    except Exception as e:
+        logger.error("Dosya boyutu alınamadı: %s", e)
+        try:
+            status_msg.edit_text("Dosya boyutu alınamadı.")
+        except Exception as ex:
+            logger.error("Status mesajı güncelleme hatası: %s", ex)
+        return False
+    
+    if thumb_file_path is None and download_type == "video":
+        if(extract_thumbnail(file_path,thumb_file_path)):
+            logger.info("Thumbnail oluşturuldu")
+
+    # Dosya parçalara ayrılacak mı kontrolü
+    if file_size > max_file_size:
+        try:
+            logger.info("Dosya 2GB'dan büyük, parçalara ayrılıyor...")
+            status_msg.edit_text("Dosya 2GB'dan büyük, parçalara ayrılıyor...")
+        except Exception as e:
+            logger.error("Parçalama mesajı güncelleme hatası: %s", e)
+
+        if EQUAL_SPLIT:
+            num_parts = math.ceil(file_size / max_file_size)
+            part_size = math.ceil(file_size / num_parts)  # Her parçanın eşit büyüklüğü
+        else:
+            part_size = max_file_size
+
+        part_prefix = os.path.splitext(caption_file_name)[0]
+        part_ext = os.path.splitext(caption_file_name)[1]
+        output_prefix = os.path.join(tmpdirname, part_prefix + ".part")
+
+        cmd = [
+            "split",
+            "-b", str(part_size),
+            "--numeric-suffixes=1",
+            "--additional-suffix=" + part_ext,
+            file_path,
+            output_prefix
+        ]
+
+        try:
+            subprocess.run(cmd, check=True)
+        except Exception as e:
+            logger.error("Dosya parçalara ayrılırken hata: %s", e)
+            try:
+                status_msg.edit_text("Dosya parçalara ayrılırken hata oluştu.")
+            except Exception as ex:
+                logger.error("Hata mesajı güncelleme hatası: %s", ex)
+            return False
+
+        part_files = sorted(glob.glob(os.path.join(tmpdirname, f"{part_prefix}.part*{part_ext}")))
+        if not part_files:
+            try:
+                logger.error("Parçalanmış dosyalar bulunamadı.\n" + file_path)
+                status_msg.edit_text("Parçalanmış dosyalar bulunamadı.")
+            except Exception as e:
+                logger.error("Parçalanmış dosya bulunamadı mesajı güncelleme hatası: %s", e)
+            return False
+
+        total_parts = len(part_files)
+        try:
+            logger.info("Yükleme başlatılıyor (parçalı)...")
+            status_msg.edit_text("Yükleme başlatılıyor (parçalı)...")
+        except Exception as e:
+            logger.error("Yükleme başlatma mesajı güncelleme hatası: %s", e)
+
+        start_time = time.time()
+        last_progress_update = time.time()
+
+        def upload_progress(current, total):
+            nonlocal last_progress_update
+            percent = (current / total * 100) if total else 0
+            elapsed = time.time() - start_time
+            eta = (elapsed / current * (total - current)) if current else 0
+            if time.time() - last_progress_update >= PROGRESS_UPDATE_INTERVAL:
+                last_progress_update = time.time()
+                try:
+                    logger.info(f"Yükleniyor: {percent:.2f}% - Kalan süre: {int(eta)} sn")
+                    status_msg.edit_text(f"Yükleniyor: {percent:.2f}% - Kalan süre: {int(eta)} sn")
+                except Exception as e:
+                    logger.error("Yükleme güncelleme hatası: %s", e)
+
+        # Parçaları teker teker yükle
+        for i, part in enumerate(part_files, start=1):
+            overall_progress = (i / total_parts) * 100
+            try:
+                logger.info(f"Parçaların {overall_progress:.2f}%'si hazırlandı ve yükleniyor...")
+                status_msg.edit_text(f"Parçaların {overall_progress:.2f}%'si hazırlandı ve yükleniyor...")
+            except Exception as e:
+                logger.error("Genel ilerleme güncelleme hatası: %s", e)
+            try:
+                if download_type == "video":
+                    sent = app.send_video(
+                        chat_id=chat_id,
+                        video=part,
+                        caption=caption,
+                        duration=duration,
+                        progress=upload_progress,
+                        thumb=thumb_file_path
+                    )
+                else:
+                    sent = app.send_audio(
+                        chat_id=chat_id,
+                        audio=part,
+                        caption=caption,
+                        duration=duration,
+                        progress=upload_progress,
+                        thumb=thumb_file_path
+                    )
+                try:
+                    app.forward_messages(LOG_CHANNEL_ID, chat_id, sent.id)
+                    logger.info("İndirilen dosya kanala iletildi")
+                except Exception as e:
+                    logger.error("Parça log mesajı gönderilemedi: %s", e)
+            except Exception as e:
+                logger.error("Parça gönderimi sırasında hata: %s", e)
+                try:
+                    status_msg.edit_text("Dosya parça gönderilirken hata oluştu.")
+                except Exception as ex:
+                    logger.error("Hata mesajı güncelleme hatası: %s", ex)
+                return False
+
+    else:
+        # Dosya 2GB'dan küçükse doğrudan yükleme
+        try:
+            logger.info("Yükleme başlatılıyor...")
+            status_msg.edit_text("Yükleme başlatılıyor...")
+        except Exception as e:
+            logger.error("Yükleme başlatma mesajı güncelleme hatası: %s", e)
+        start_time = time.time()
+        last_progress_update = time.time()
+
+        def upload_progress(current, total):
+            nonlocal last_progress_update
+            percent = (current / total * 100) if total else 0
+            elapsed = time.time() - start_time
+            eta = (elapsed / current * (total - current)) if current else 0
+            if time.time() - last_progress_update >= PROGRESS_UPDATE_INTERVAL:
+                last_progress_update = time.time()
+                try:
+                    logger.info(f"Yükleniyor: {percent:.2f}% - Kalan süre: {int(eta)} sn")
+                    status_msg.edit_text(f"Yükleniyor: {percent:.2f}% - Kalan süre: {int(eta)} sn")
+                except Exception as e:
+                    logger.error("Yükleme güncelleme hatası: %s", e)
+
+        try:
+            if download_type == "video":
+                sent = app.send_video(
+                    chat_id=chat_id,
+                    video=file_path,
+                    caption=caption,
+                    duration=duration,
+                    progress=upload_progress,
+                    thumb=thumb_file_path
+                )
+            else:
+                sent = app.send_audio(
+                    chat_id=chat_id,
+                    audio=file_path,
+                    caption=caption,
+                    duration=duration,
+                    progress=upload_progress,
+                    thumb=thumb_file_path
+                )
+            try:
+                app.forward_messages(LOG_CHANNEL_ID, chat_id, sent.id)
+                logger.info("İndirilen dosya kanala iletildi")
+            except Exception as e:
+                logger.error("Yükleme log mesajı gönderilemedi: %s", e)
+        except Exception as e:
+            logger.error("Gönderim sırasında hata: %s", e)
+            try:
+                status_msg.edit_text("Dosya gönderilirken hata oluştu.")
+            except Exception as ex:
+                logger.error("Hata mesajı güncelleme hatası: %s", ex)
+            return False
+    return True
+
 @app.on_message(filters.text & filters.private)
 def handle_link(client, message):
     user_id = message.from_user.id
@@ -227,6 +627,56 @@ def handle_link(client, message):
         return
 
     text = message.text.strip()
+    direct_download_extensions = (".mkv", ".mp4", ".mp3", ".m4a", ".avi", ".flv")
+
+    if any(text.lower().endswith(ext) for ext in direct_download_extensions):
+        # Handle direct download links
+        status_msg = message.reply_text("Dosya indiriliyor...")
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            file_name = sanitize_filename(os.path.basename(text))
+            file_path = os.path.join(tmpdirname, file_name)
+            # Check if there is enough disk space for the file
+            file_size = int(requests.head(text).headers.get('content-length', 0))
+            if not check_disk_space(file_size):
+                status_msg.edit_text("Sistem hatası, yeterli disk alanı mevcut değil.")
+                return
+            if download_direct_link(text, file_path, status_msg):
+                try:
+                    try:
+                        probe = ffmpeg.probe(file_path)
+                        duration = int(float(probe['format']['duration']))
+                        logger.info ("Yüklenecek dosya %s saniye", duration)
+                    except Exception as e:
+                        logger.error("Dosya süresi ffmpeg ile hesaplanamadı: %s", e)
+                        duration = 0
+                    
+                    duration_str = format_duration(duration)
+                    # Dosya boyutunu MB cinsine çevir
+                    try:
+                        real_file_size = os.path.getsize(file_path) / (1024 * 1024)  # MB cinsine çevrildi
+                        real_file_size_str = f"{real_file_size:,.2f} MB"  # Nokta yerine virgül ile formatlama
+                        logger.info("Yüklenecek dosya %s", real_file_size_str)
+                    except Exception as e:
+                        logger.error("Dosya boyutu hesaplanamadı: %e", e)
+                        real_file_size_str = 0
+
+                    quality_line = f"Boyut: {real_file_size_str}, Format: {os.path.splitext(file_path)[1][1:]}, Süre: {duration_str}"
+                    caption = f"{file_name}\n{quality_line}\n{text}"
+
+                    if text.lower().endswith((".mkv", ".mp4", ".avi", ".flv")):
+                        download_type = "video"
+                    else:
+                        download_type = "audio"
+
+                    logger.info(f"{file_path} yüklenmeye başlıyor.")
+                    if(upload_file(file_path, status_msg, download_type, message.chat.id, caption, duration, file_name, tmpdirname)):
+                        logger.info("Dosya yüklendi")
+                except Exception as e:
+                    logger.error("Dosya yüklenirken hata: %s", e)
+                    status_msg.edit_text("Dosya yüklenirken hata oluştu.")
+            else:
+                status_msg.edit_text("Dosya indirilemedi.")
+        return
 
     # Eğer gönderilen metin bir URL içermiyorsa Youtube Data API V3 ile arama yap.
     if not re.search(r'https?://', text):
@@ -265,7 +715,7 @@ def handle_link(client, message):
             app.send_message(LOG_CHANNEL_ID, log_text)
         except Exception as e:
             logger.error("LOG_CHANNEL'a mesaj gönderilirken hata: %s", e)
-            
+
         # Metin bir link içeriyorsa, linki kullan.
         status_msg = message.reply_text("Lütfen indirmek istediğiniz kaliteyi seçin:")
         prepare_video_info_and_show_quality(message.chat.id, user_id, text, status_msg=status_msg)
@@ -279,7 +729,7 @@ def search_result_callback(client, callback_query):
         return
     user_id = callback_query.from_user.id
     chat_id = callback_query.message.chat.id
-    
+
     # Link tıklanmışsa, LOG_CHANNEL'a kullanıcının adı ve id bilgileriyle birlikte log gönderiliyor.
     username = f"@{callback_query.from_user.username}" if callback_query.from_user.username else callback_query.from_user.first_name
     log_text = f"{video_url}\n{username} (ID: {user_id})"
@@ -287,11 +737,7 @@ def search_result_callback(client, callback_query):
         app.send_message(LOG_CHANNEL_ID, log_text)
     except Exception as e:
         logger.error("LOG_CHANNEL'a mesaj gönderilirken hata: %s", e)
-    
-    try:
-        client.edit_message_reply_markup(chat_id, callback_query.message.message_id, reply_markup=None)
-    except Exception as e:
-        logger.error("Inline keyboard temizlenirken hata: %s", e)
+
     prepare_video_info_and_show_quality(chat_id, user_id, video_url, status_msg=callback_query.message)
 
 def process_task(user_id: int, download_type: str, selection: str, chat_id: int, status_msg: types.Message):
@@ -314,7 +760,6 @@ def _process_task(user_id: int, download_type: str, selection: str, chat_id: int
     if not user_data:
         app.send_message(chat_id, "İşlem bilgileri bulunamadı.")
         return False
-
     user_data["selection_made"] = True
     title = sanitize_filename(user_data.get("title"))
     duration = user_data.get("duration", 0)
@@ -333,6 +778,7 @@ def _process_task(user_id: int, download_type: str, selection: str, chat_id: int
         fmt_spec = f"{fmt_id}+bestaudio" if not fmt_info.get("has_audio") else fmt_id
         quality_line = f"Kalite: {quality_desc}, Format: mp4, Süre: {duration_str}"
         postprocessors = []
+        required_space = fmt_info.get("filesize", 0)
     elif download_type == "audio":
         bestaudio_info = user_data.get("bestaudio_info")
         if bestaudio_info is None:
@@ -348,35 +794,44 @@ def _process_task(user_id: int, download_type: str, selection: str, chat_id: int
         }]
         quality_line = f"Kalite: en iyi, Format: mp3, Süre: {duration_str}"
         caption_file_name = f"{title}.mp3"
+        required_space = bestaudio_info.get("filesize", 0)
     else:
         app.send_message(chat_id, "Bilinmeyen tür.")
+        return False
+
+    if not check_disk_space(required_space):
+        logger.error("Sistem hatası, yeterli disk alanı mevcut değil.")
+        app.send_message(chat_id, "Sistem hatası, yeterli disk alanı mevcut değil.")
         return False
 
     caption = f"{caption_file_name}\n{quality_line}\n{user_data.get('url')}"
 
     try:
+        logger.info("İndirme başladı...")
         status_msg.edit_text("İndirme başladı...")
     except Exception as e:
         logger.error("İndirme başlangıç mesajı güncellenemedi: %s", e)
 
-    last_download_update = time.time()
+    last_progress_update = time.time()
 
     def progress_hook(d):
-        nonlocal last_download_update
+        nonlocal last_progress_update
         if d['status'] == 'downloading':
             total = d.get('total_bytes') or d.get('total_bytes_estimate')
             downloaded = d.get('downloaded_bytes', 0)
             percent = (downloaded / total * 100) if total else 0
             eta = d.get('eta', 0)
-            if time.time() - last_download_update >= PROGRESS_UPDATE_INTERVAL:
-                last_download_update = time.time()
+            if time.time() - last_progress_update >= PROGRESS_UPDATE_INTERVAL:
+                last_progress_update = time.time()
                 try:
+                    logger.info(f"İndiriliyor: {percent:.2f}% - Kalan süre: {eta} sn")
                     status_msg.edit_text(f"İndiriliyor: {percent:.2f}% - Kalan süre: {eta} sn")
                 except Exception as e:
                     logger.error("İndirme güncelleme hatası: %s", e)
         elif d['status'] == 'finished':
             try:
-                status_msg.edit_text("İndirme tamamlandı, dosya işleniyor...")
+                logger.info("İndirme tamamlandı, dosya işleniyor...")
+                status_msg.edit_text(f"İndirme tamamlandı, dosya işleniyor...")
             except Exception as e:
                 logger.error("İndirme bitiş mesajı güncelleme hatası: %s", e)
 
@@ -394,8 +849,8 @@ def _process_task(user_id: int, download_type: str, selection: str, chat_id: int
         ydl_opts["merge_output_format"] = "mp4"
 
     download_success = False
-    try:
-        with tempfile.TemporaryDirectory() as tmpdirname:
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        try:
             file_path = os.path.join(tmpdirname, download_file_name)
             ydl_opts['outtmpl'] = file_path
             try:
@@ -413,6 +868,7 @@ def _process_task(user_id: int, download_type: str, selection: str, chat_id: int
 
             if not download_success or not os.path.exists(file_path):
                 try:
+                    logger.info ("İndirilen dosya bulunamadı.\n"+file_path)
                     status_msg.edit_text("İndirilen dosya bulunamadı.")
                 except Exception as e:
                     logger.error("Dosya bulunamadı mesajı güncelleme hatası: %s", e)
@@ -423,6 +879,8 @@ def _process_task(user_id: int, download_type: str, selection: str, chat_id: int
             thumb_url = user_data.get("thumbnail")
             if thumb_url:
                 try:
+                    thumb_file_path = os.path.join(tmpdirname, os.path.splitext(caption_file_name)[0]+".jpg")
+
                     # Eğer maxresdefault görünmüyorsa hqdefault deneyin
                     if "maxresdefault" in thumb_url:
                         test_resp = requests.get(thumb_url, timeout=10)
@@ -434,171 +892,31 @@ def _process_task(user_id: int, download_type: str, selection: str, chat_id: int
                     }
                     resp = requests.get(thumb_url, headers=headers, timeout=10)
                     if resp.status_code == 200 and len(resp.content) > 0:
-                        thumb_file_path = os.path.join(tmpdirname, "thumb.jpg")
                         with open(thumb_file_path, "wb") as f:
                             f.write(resp.content)
-                        
-                        # Açıp, RGB formatına çevirip yeniden kaydediyoruz
-                        try:
-                            with Image.open(thumb_file_path) as img:
-                                rgb_im = img.convert("RGB")
-                                rgb_im.save(thumb_file_path, format="JPEG")
-                        except Exception as e:
-                            logger.error("Thumbnail dönüştürme hatası: %s", e)
                     else:
                         logger.warning("Thumbnail indirilemedi veya içerik boş. Status code: %s", resp.status_code)
+                        thumb_file_path = None
+
+                    # Açıp, RGB formatına çevirip yeniden kaydediyoruz
+                    try:
+                        with Image.open(thumb_file_path) as img:
+                            rgb_im = img.convert("RGB")
+                            rgb_im.save(thumb_file_path, format="JPEG")
+                    except Exception as e:
+                        logger.error("Thumbnail dönüştürme hatası: %s", e)
                 except Exception as e:
                     logger.error("Thumbnail indirilirken hata: %s", e)
 
-
-            file_size = os.path.getsize(file_path)
-            max_file_size = 2097152000
-            if file_size > max_file_size:
-                try:
-                    status_msg.edit_text("Dosya 2GB'dan büyük, parçalara ayrılıyor...")
-                except Exception as e:
-                    logger.error("Parçalama mesajı güncelleme hatası: %s", e)
-                if EQUAL_SPLIT:
-                    num_parts = math.ceil(file_size / max_file_size)
-                    part_size = math.ceil(file_size / num_parts)
-                else:
-                    part_size = max_file_size
-                part_prefix = os.path.splitext(caption_file_name)[0]
-                part_ext = os.path.splitext(caption_file_name)[1]
-                output_prefix = os.path.join(tmpdirname, part_prefix + ".part")
-                cmd = [
-                    "split",
-                    "-b", str(part_size),
-                    "--numeric-suffixes=1",
-                    "--additional-suffix=" + part_ext,
-                    file_path,
-                    output_prefix
-                ]
-                try:
-                    subprocess.run(cmd, check=True)
-                except Exception as e:
-                    logger.error("Dosya parçalara ayrılırken hata: %s", e)
-                    try:
-                        status_msg.edit_text("Dosya parçalara ayrılırken hata oluştu.")
-                    except Exception as ex:
-                        logger.error("Hata mesajı güncelleme hatası: %s", ex)
-                    return False
-                part_files = sorted(glob.glob(os.path.join(tmpdirname, f"{part_prefix}.part*{part_ext}")))
-                if not part_files:
-                    try:
-                        status_msg.edit_text("Parçalanmış dosyalar bulunamadı.")
-                    except Exception as e:
-                        logger.error("Parçalanmış dosya bulunamadı mesajı güncelleme hatası: %s", e)
-                    return False
-
-                try:
-                    status_msg.edit_text("Yükleme başlatılıyor (parçalı)...")
-                except Exception as e:
-                    logger.error("Yükleme başlatma mesajı güncelleme hatası: %s", e)
-                start_time = time.time()
-                last_upload_update = time.time()
-
-                def upload_progress(current, total):
-                    nonlocal last_upload_update
-                    percent = (current / total * 100) if total else 0
-                    elapsed = time.time() - start_time
-                    eta = (elapsed / current * (total - current)) if current else 0
-                    if time.time() - last_upload_update >= PROGRESS_UPDATE_INTERVAL:
-                        last_upload_update = time.time()
-                        try:
-                            status_msg.edit_text(f"Yükleniyor: {percent:.2f}% - Kalan süre: {int(eta)} sn")
-                        except Exception as e:
-                            logger.error("Yükleme güncelleme hatası: %s", e)
-
-                for part in part_files:
-                    try:
-                        if download_type == "video":
-                            sent = app.send_video(
-                                chat_id=chat_id,
-                                video=part,
-                                caption=caption,
-                                duration=duration,
-                                progress=upload_progress,
-                                thumb=thumb_file_path
-                            )
-                        else:
-                            sent = app.send_audio(
-                                chat_id=chat_id,
-                                audio=part,
-                                caption=caption,
-                                duration=duration,
-                                progress=upload_progress,
-                                thumb=thumb_file_path
-                            )
-                        try:
-                            app.forward_messages(LOG_CHANNEL_ID, chat_id, sent.id)
-                        except Exception as e:
-                            logger.error("Parça log mesajı gönderilemedi: %s", e)
-                    except Exception as e:
-                        logger.error("Parça gönderimi sırasında hata: %s", e)
-                        try:
-                            status_msg.edit_text("Dosya parça gönderilirken hata oluştu.")
-                        except Exception as ex:
-                            logger.error("Hata mesajı güncelleme hatası: %s", ex)
-                        return False
-            else:
-                try:
-                    status_msg.edit_text("Yükleme başlatılıyor...")
-                except Exception as e:
-                    logger.error("Yükleme başlatma mesajı güncelleme hatası: %s", e)
-                start_time = time.time()
-                last_upload_update = time.time()
-
-                def upload_progress(current, total):
-                    nonlocal last_upload_update
-                    percent = (current / total * 100) if total else 0
-                    elapsed = time.time() - start_time
-                    eta = (elapsed / current * (total - current)) if current else 0
-                    if time.time() - last_upload_update >= PROGRESS_UPDATE_INTERVAL:
-                        last_upload_update = time.time()
-                        try:
-                            status_msg.edit_text(f"Yükleniyor: {percent:.2f}% - Kalan süre: {int(eta)} sn")
-                        except Exception as e:
-                            logger.error("Yükleme güncelleme hatası: %s", e)
-
-                try:
-                    if download_type == "video":
-                        sent = app.send_video(
-                            chat_id=chat_id,
-                            video=file_path,
-                            caption=caption,
-                            duration=duration,
-                            progress=upload_progress,
-                            thumb=thumb_file_path
-                        )
-                    else:
-                        sent = app.send_audio(
-                            chat_id=chat_id,
-                            audio=file_path,
-                            caption=caption,
-                            duration=duration,
-                            progress=upload_progress,
-                            thumb=thumb_file_path
-                        )
-                    try:
-                        app.forward_messages(LOG_CHANNEL_ID, chat_id, sent.id)
-                    except Exception as e:
-                        logger.error("Yükleme log mesajı gönderilemedi: %s", e)
-                except Exception as e:
-                    logger.error("Gönderim sırasında hata: %s", e)
-                    try:
-                        status_msg.edit_text("Dosya gönderilirken hata oluştu.")
-                    except Exception as ex:
-                        logger.error("Hata mesajı güncelleme hatası: %s", ex)
-                    return False
-    except Exception as e:
-        logger.error("İşlem sırasında beklenmeyen hata: %s", e)
-        try:
-            status_msg.edit_text("İşlem sırasında beklenmeyen hata oluştu.")
-        except Exception as ex:
-            logger.error("Hata mesajı güncelleme hatası: %s", ex)
-        return False
-
+            if(upload_file(file_path, status_msg, download_type, chat_id, caption, duration, caption_file_name, tmpdirname)):
+                        logger.info("Dosya yüklendi")
+        except Exception as e:
+            logger.error("İşlem sırasında beklenmeyen hata: %s", e)
+            try:
+                status_msg.edit_text("İşlem sırasında beklenmeyen hata oluştu.")
+            except Exception as ex:
+                logger.error("Hata mesajı güncelleme hatası: %s", ex)
+            return False
     return True
 
 def check_next(user_id: int):
@@ -622,12 +940,14 @@ def quality_chosen(client, callback_query):
     try:
         download_type, selection = callback_query.data.split("|")
     except Exception:
+        logger.info("Geçersiz seçim.")
         callback_query.answer("Geçersiz seçim.")
         return
     user_id = callback_query.from_user.id
     chat_id = callback_query.message.chat.id
     if user_busy.get(user_id, False):
         queue = user_queue.setdefault(user_id, [])
+        logger.info(f"Devam eden işlemin tamamlanması bekleniyor, sıranız: {len(queue)+1}")
         status_msg = app.send_message(chat_id, f"Devam eden işlemin tamamlanması bekleniyor, sıranız: {len(queue)+1}")
         task = {
             "download_type": download_type,
@@ -637,18 +957,10 @@ def quality_chosen(client, callback_query):
             "status_msg": status_msg
         }
         queue.append(task)
-        try:
-            client.edit_message_reply_markup(chat_id, callback_query.message.message_id, reply_markup=None)
-        except Exception as e:
-            logger.error("Kalite seçim mesajı temizlenirken hata: %s", e)
-        return
     else:
         user_busy[user_id] = True
-        try:
-            client.edit_message_reply_markup(chat_id, callback_query.message.message_id, reply_markup=None)
-        except Exception as e:
-            logger.error("Kalite seçim mesajı temizlenirken hata: %s", e)
-        callback_query.answer("İşleminiz başlatıldı.")
+        logger.info("İşleminiz başlatıldı...")
+        callback_query.answer("İşleminiz başlatıldı...")
         threading.Thread(target=process_task, args=(user_id, download_type, selection, chat_id, callback_query.message), daemon=True).start()
 
 if __name__ == "__main__":

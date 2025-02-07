@@ -3,3 +3,4 @@ requests
 pyrogram
 tgcrypto
 Pillow
+ffmpeg-python

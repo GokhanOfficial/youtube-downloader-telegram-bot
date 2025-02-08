@@ -391,12 +391,28 @@ def download_direct_link(url: str, output_path: str, status_msg: types.Message):
     except Exception as e:
         logger.error("Direct download failed: %s", e)
         return False
-    
+
+def is_thumb_avaible(thumb_path):
+    try:
+        if not os.path.exists(thumb_path):
+            logger.info("Thumbnail mevcut değil.")
+            return False
+
+        with Image.open(thumb_path) as img:
+            img.verify()
+            if img.format.upper() == "JPEG":
+                logger.info("Thumbnail dosyası geçerli.")
+                return True
+            else: return False
+    except Exception as e:
+        logger.info("Thumbnail dosyası geçerli JPEG değil, işlem devam ediyor: %s", e)
+        return False
+        
+
+
+
 def extract_thumbnail(video_path, thumb_path, timestamp="00:00:10"):
     try:
-        if thumb_path is None:
-            thumb_path = "{os.path.splitext(video_path)[0]}.jpg"
-
         # FFmpeg ile thumbnail oluştur
         (
             ffmpeg
@@ -439,6 +455,8 @@ def upload_file(
         tmpdirname = os.path.dirname(file_path)
     if caption_file_name is None:
         caption_file_name = os.path.basename(file_path)
+    if thumb_file_path is None:
+        thumb_file_path = os.path.join(tmpdirname, os.path.splitext(caption_file_name)[0]+".jpg")
 
     try:
         file_size = os.path.getsize(file_path)
@@ -449,8 +467,8 @@ def upload_file(
         except Exception as ex:
             logger.error("Status mesajı güncelleme hatası: %s", ex)
         return False
-    
-    if thumb_file_path is None and download_type == "video":
+
+    if download_type == "video" and not is_thumb_avaible(thumb_file_path):
         if(extract_thumbnail(file_path,thumb_file_path)):
             logger.info("Thumbnail oluşturuldu")
 
@@ -775,8 +793,8 @@ def _process_task(user_id: int, download_type: str, selection: str, chat_id: int
             app.send_message(chat_id, "Seçilen format bilgileri bulunamadı.")
             return False
         quality_desc = fmt_info.get("desc")
+        resolution = quality_desc.split(" - ")[0]
         fmt_spec = f"{fmt_id}+bestaudio" if not fmt_info.get("has_audio") else fmt_id
-        quality_line = f"Kalite: {quality_desc}, Format: mp4, Süre: {duration_str}"
         postprocessors = []
         required_space = fmt_info.get("filesize", 0)
     elif download_type == "audio":
@@ -786,13 +804,13 @@ def _process_task(user_id: int, download_type: str, selection: str, chat_id: int
             return False
         file_ext = bestaudio_info.get("ext", "m4a")
         download_file_name = f"{title}"
+        resolution = "en iyi"
         fmt_spec = "bestaudio"
         postprocessors = [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
             "preferredquality": "0"  # Orijinal kaliteyi korur
         }]
-        quality_line = f"Kalite: en iyi, Format: mp3, Süre: {duration_str}"
         caption_file_name = f"{title}.mp3"
         required_space = bestaudio_info.get("filesize", 0)
     else:
@@ -803,8 +821,6 @@ def _process_task(user_id: int, download_type: str, selection: str, chat_id: int
         logger.error("Sistem hatası, yeterli disk alanı mevcut değil.")
         app.send_message(chat_id, "Sistem hatası, yeterli disk alanı mevcut değil.")
         return False
-
-    caption = f"{caption_file_name}\n{quality_line}\n{user_data.get('url')}"
 
     try:
         logger.info("İndirme başladı...")
@@ -894,6 +910,7 @@ def _process_task(user_id: int, download_type: str, selection: str, chat_id: int
                     if resp.status_code == 200 and len(resp.content) > 0:
                         with open(thumb_file_path, "wb") as f:
                             f.write(resp.content)
+                        logger.info("Thumbnail yt-dlp ile indirildi. %s", thumb_file_path)
                     else:
                         logger.warning("Thumbnail indirilemedi veya içerik boş. Status code: %s", resp.status_code)
                         thumb_file_path = None
@@ -908,7 +925,17 @@ def _process_task(user_id: int, download_type: str, selection: str, chat_id: int
                 except Exception as e:
                     logger.error("Thumbnail indirilirken hata: %s", e)
 
-            if(upload_file(file_path, status_msg, download_type, chat_id, caption, duration, caption_file_name, tmpdirname)):
+            try:
+                real_file_size = os.path.getsize(file_path) / (1024 * 1024)  # MB cinsine çevrildi
+                real_file_size_str = f"{real_file_size:,.2f} MB"  # Nokta yerine virgül ile formatlama
+                logger.info("Yüklenecek dosya %s", real_file_size_str)
+            except Exception as e:
+                logger.error("Dosya boyutu hesaplanamadı: %e", e)
+                real_file_size_str = "0 MB"
+            quality_line = f"Kalite: {resolution}, Boyut: {real_file_size_str} Format: {os.path.splitext(caption_file_name)[1][1:]}, Süre: {duration_str}"
+            caption = f"{caption_file_name}\n{quality_line}\n{user_data.get('url')}"
+
+            if(upload_file(file_path, status_msg, download_type, chat_id, caption, duration, caption_file_name, tmpdirname, thumb_file_path)):
                         logger.info("Dosya yüklendi")
         except Exception as e:
             logger.error("İşlem sırasında beklenmeyen hata: %s", e)
